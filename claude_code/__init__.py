@@ -1,6 +1,6 @@
-"""Claude Code - Clipboard-bridge wrapper that turns your Claude Pro web account into a local API."""
+"""Claude Code - Browser-automated wrapper that turns your Claude Pro account into a local API."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .wrapper import ClaudeCodeWrapper
 from .parser import parse_response, ParsedResponse, ToolCall

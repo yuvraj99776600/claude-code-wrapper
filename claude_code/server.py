@@ -1,212 +1,233 @@
-"""Local HTTP server that exposes an Anthropic-compatible /v1/messages endpoint.
+"""FastAPI server that exposes Claude via browser automation.
 
-Incoming requests are converted into pasteable prompts; the user copies Claude's
-response back; tool calls are executed locally; the loop continues until done.
+Each API key maps to its own browser tab / Claude chat session.
+The server handles the full agentic tool loop internally:
+  prompt → Claude → parse tool calls → execute → send results → repeat → return final answer.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
-import threading
-import uuid
-import time
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, request, jsonify, Response
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 
-from .wrapper import ClaudeCodeWrapper
+from .chat_pool import ChatPool
 from .prompt_builder import build_initial_prompt, build_tool_results_prompt
 from .parser import parse_response
+from .tools import dispatch_tool
+
+log = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------ #
+#  Config (set via env vars or CLI flags at startup)                   #
+# ------------------------------------------------------------------ #
+
+_pool: ChatPool | None = None
+
+_ALLOWED_ROOTS: list[str] = []
+_WORKING_DIR: str = ""
+_MAX_TURNS: int = 40
 
 
 # ------------------------------------------------------------------ #
-#  In-memory session store                                            #
+#  Request / response models                                          #
 # ------------------------------------------------------------------ #
 
-class Session:
-    """Tracks one multi-turn agentic conversation."""
+class MessageRequest(BaseModel):
+    """Incoming request body — mimics the Anthropic Messages API shape."""
+    prompt: str | None = None
+    content: str | None = None
+    messages: list[dict[str, Any]] | None = None
+    file_paths: list[str] = Field(default_factory=list)
+    max_turns: int | None = None
 
-    def __init__(self, session_id: str, wrapper: ClaudeCodeWrapper) -> None:
-        self.id = session_id
-        self.wrapper = wrapper
-        self.state: str = "idle"  # idle | waiting_for_paste | done
-        self.pending_prompt: str = ""  # prompt waiting to be copied
-        self.tool_results: list[dict[str, Any]] = []
-        self.final_text: str = ""
-        self.turns: int = 0
-        self.error: str | None = None
+    def get_prompt(self) -> str:
+        if self.prompt:
+            return self.prompt
+        if self.content:
+            return self.content
+        if self.messages:
+            for msg in self.messages:
+                if msg.get("role") == "user":
+                    c = msg.get("content", "")
+                    if isinstance(c, list):
+                        return " ".join(
+                            b.get("text", "") for b in c if b.get("type") == "text"
+                        )
+                    return str(c)
+        return ""
 
 
-_sessions: dict[str, Session] = {}
-_sessions_lock = threading.Lock()
+class ToolResultEntry(BaseModel):
+    tool_name: str
+    tool_input: dict[str, Any]
+    result: str
+
+
+class MessageResponse(BaseModel):
+    text: str
+    tool_results: list[ToolResultEntry]
+    turns: int
 
 
 # ------------------------------------------------------------------ #
-#  Flask app                                                          #
+#  App factory                                                        #
 # ------------------------------------------------------------------ #
 
 def create_app(
+    num_slots: int = 3,
+    headless: bool = True,
+    browser_profile: str | None = None,
     allowed_roots: list[str] | None = None,
     working_dir: str | None = None,
     max_turns: int = 40,
-) -> Flask:
-    app = Flask(__name__)
+) -> FastAPI:
+    global _pool, _ALLOWED_ROOTS, _WORKING_DIR, _MAX_TURNS
 
-    _roots = [str(Path(r).resolve()) for r in (allowed_roots or [os.getcwd()])]
-    _wdir = working_dir or _roots[0]
+    _ALLOWED_ROOTS = [str(Path(r).resolve()) for r in (allowed_roots or [os.getcwd()])]
+    _WORKING_DIR = working_dir or _ALLOWED_ROOTS[0]
+    _MAX_TURNS = max_turns
 
-    # -------------------------------------------------------------- #
-    #  POST /v1/messages  — start or continue an agentic session      #
-    # -------------------------------------------------------------- #
-    @app.route("/v1/messages", methods=["POST"])
-    def messages():
-        """Accept an Anthropic-style Messages request.
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        global _pool
+        _pool = ChatPool(
+            num_slots=num_slots,
+            headless=headless,
+            browser_profile=browser_profile,
+        )
+        keys = await _pool.start()
 
-        Required body fields:
-            prompt (str): The user's natural-language task.
-        Optional:
-            file_paths (list[str]): Files to pre-load.
-            session_id (str): Resume an existing session.
-        """
-        body = request.get_json(force=True)
-        prompt = body.get("prompt") or body.get("content") or ""
+        print("\n" + "=" * 60)
+        print("  Claude Code API Server")
+        print("=" * 60)
+        print(f"\n  {num_slots} chat slot(s) ready. Your API keys:\n")
+        for i, key in enumerate(keys, 1):
+            print(f"    Slot {i}: {key}")
+        print(f"\n  Usage:")
+        print(f'    curl -X POST http://localhost:PORT/v1/messages \\')
+        print(f'      -H "Authorization: Bearer <KEY>" \\')
+        print(f'      -H "Content-Type: application/json" \\')
+        print(f'      -d \'{{"prompt": "your task here", "file_paths": []}}\'')
+        print("=" * 60 + "\n")
 
-        # Also accept the full Anthropic format
-        if not prompt and "messages" in body:
-            for msg in body["messages"]:
-                if msg.get("role") == "user":
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        prompt = " ".join(
-                            b.get("text", "") for b in content if b.get("type") == "text"
-                        )
-                    else:
-                        prompt = content
-                    break
+        yield
 
+        await _pool.stop()
+
+    app = FastAPI(
+        title="Claude Code API",
+        description="Browser-automated Claude API — no API key from Anthropic needed.",
+        lifespan=lifespan,
+    )
+
+    # ---- Auth helper ---- #
+
+    def _get_api_key(authorization: str | None) -> str:
+        if not authorization:
+            raise HTTPException(401, "Missing Authorization header")
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1]
+        if len(parts) == 1:
+            return parts[0]
+        raise HTTPException(401, "Invalid Authorization format. Use 'Bearer <key>'")
+
+    # ---- Routes ---- #
+
+    @app.post("/v1/messages", response_model=MessageResponse)
+    async def messages(
+        body: MessageRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """Send a prompt, run the full agentic tool loop, return the result."""
+        api_key = _get_api_key(authorization)
+        if not _pool or not _pool.validate_key(api_key):
+            raise HTTPException(403, "Invalid API key")
+
+        prompt = body.get_prompt()
         if not prompt:
-            return jsonify({"error": "No prompt provided"}), 400
+            raise HTTPException(400, "No prompt provided")
 
-        file_paths = body.get("file_paths", [])
+        turns_limit = body.max_turns or _MAX_TURNS
+        file_paths = body.file_paths
 
-        wrapper = ClaudeCodeWrapper(
-            allowed_roots=_roots,
-            working_dir=_wdir,
-            max_turns=max_turns,
-            auto_copy=True,
+        # Build the initial prompt with system instructions + file context
+        outgoing = build_initial_prompt(prompt, file_paths)
+        all_tool_results: list[dict[str, Any]] = []
+        final_text = ""
+
+        for turn in range(turns_limit):
+            # Send to Claude via the browser
+            try:
+                raw_response = await _pool.send_message(api_key, outgoing)
+            except Exception as exc:
+                log.error("Browser error on turn %d: %s", turn, exc)
+                raise HTTPException(502, f"Browser error: {exc}")
+
+            parsed = parse_response(raw_response)
+
+            if parsed.text:
+                final_text = parsed.text
+
+            if not parsed.has_tool_calls:
+                break
+
+            # Execute tool calls locally
+            turn_results: list[dict[str, Any]] = []
+            for tc in parsed.tool_calls:
+                result_str = dispatch_tool(
+                    tool_name=tc.tool,
+                    tool_input=tc.params,
+                    allowed_roots=_ALLOWED_ROOTS,
+                    working_dir=_WORKING_DIR,
+                )
+                entry = {
+                    "tool_name": tc.tool,
+                    "tool_input": tc.params,
+                    "result": result_str,
+                }
+                turn_results.append(entry)
+                all_tool_results.append(entry)
+
+            # Build follow-up prompt with results and send again
+            outgoing = build_tool_results_prompt(turn_results)
+
+        return MessageResponse(
+            text=final_text,
+            tool_results=[ToolResultEntry(**r) for r in all_tool_results],
+            turns=turn + 1,
         )
 
-        session_id = str(uuid.uuid4())
-        session = Session(session_id, wrapper)
+    @app.post("/v1/chat/new")
+    async def new_chat(authorization: str | None = Header(default=None)):
+        """Reset the slot to a fresh Claude conversation."""
+        api_key = _get_api_key(authorization)
+        if not _pool or not _pool.validate_key(api_key):
+            raise HTTPException(403, "Invalid API key")
+        await _pool.new_chat(api_key)
+        return {"status": "ok", "message": "New chat started"}
 
-        formatted = build_initial_prompt(prompt, file_paths)
-        session.pending_prompt = formatted
-        session.state = "waiting_for_paste"
+    @app.get("/v1/keys")
+    async def list_keys():
+        """List all API keys and their status (for admin use)."""
+        if not _pool:
+            return {"keys": []}
+        return {"keys": _pool.list_keys()}
 
-        with _sessions_lock:
-            _sessions[session_id] = session
-
-        return jsonify({
-            "session_id": session_id,
-            "status": "waiting_for_paste",
-            "prompt": formatted,
-            "message": "Copy the 'prompt' field and paste it into claude.ai. Then POST Claude's response to /v1/sessions/<session_id>/respond",
-        })
-
-    # -------------------------------------------------------------- #
-    #  POST /v1/sessions/<id>/respond  — paste Claude's reply back    #
-    # -------------------------------------------------------------- #
-    @app.route("/v1/sessions/<session_id>/respond", methods=["POST"])
-    def respond(session_id: str):
-        with _sessions_lock:
-            session = _sessions.get(session_id)
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        if session.state != "waiting_for_paste":
-            return jsonify({"error": f"Session state is '{session.state}', not waiting_for_paste"}), 409
-
-        body = request.get_json(force=True)
-        raw_response = body.get("response", "")
-        if not raw_response:
-            return jsonify({"error": "No response provided"}), 400
-
-        parsed = parse_response(raw_response)
-        session.turns += 1
-
-        if parsed.text:
-            session.final_text = parsed.text
-
-        if not parsed.has_tool_calls:
-            # Done — no more tool calls
-            session.state = "done"
-            return jsonify({
-                "session_id": session_id,
-                "status": "done",
-                "text": session.final_text,
-                "tool_results": session.tool_results,
-                "turns": session.turns,
-            })
-
-        # Execute tool calls locally
-        turn_results: list[dict[str, Any]] = []
-        for tc in parsed.tool_calls:
-            from .tools import dispatch_tool
-            result_str = dispatch_tool(
-                tool_name=tc.tool,
-                tool_input=tc.params,
-                allowed_roots=session.wrapper.allowed_roots,
-                working_dir=session.wrapper.working_dir,
-            )
-            entry = {
-                "tool_name": tc.tool,
-                "tool_input": tc.params,
-                "result": result_str,
-            }
-            turn_results.append(entry)
-            session.tool_results.append(entry)
-
-        # Build follow-up prompt
-        follow_up = build_tool_results_prompt(turn_results)
-        session.pending_prompt = follow_up
-        session.state = "waiting_for_paste"
-
-        return jsonify({
-            "session_id": session_id,
-            "status": "waiting_for_paste",
-            "prompt": follow_up,
-            "tool_calls_executed": [
-                {"tool": r["tool_name"], "summary": r["result"][:200]}
-                for r in turn_results
-            ],
-            "turns": session.turns,
-            "message": "Tools executed. Copy the 'prompt' field and paste it into claude.ai, then POST the response again.",
-        })
-
-    # -------------------------------------------------------------- #
-    #  GET /v1/sessions/<id>  — check session status                  #
-    # -------------------------------------------------------------- #
-    @app.route("/v1/sessions/<session_id>", methods=["GET"])
-    def get_session(session_id: str):
-        with _sessions_lock:
-            session = _sessions.get(session_id)
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        return jsonify({
-            "session_id": session_id,
-            "status": session.state,
-            "pending_prompt": session.pending_prompt if session.state == "waiting_for_paste" else None,
-            "final_text": session.final_text if session.state == "done" else None,
-            "tool_results": session.tool_results,
-            "turns": session.turns,
-        })
-
-    # -------------------------------------------------------------- #
-    #  GET /health                                                    #
-    # -------------------------------------------------------------- #
-    @app.route("/health", methods=["GET"])
-    def health():
-        return jsonify({"status": "ok", "sessions": len(_sessions)})
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "ok",
+            "slots": _pool.list_keys() if _pool else [],
+        }
 
     return app

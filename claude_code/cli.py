@@ -83,21 +83,23 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
-    """Start the local API server."""
+    """Start the local API server with browser automation."""
+    import uvicorn
     from .server import create_app
 
     app = create_app(
+        num_slots=args.slots,
+        headless=not args.visible,
+        browser_profile=args.browser_profile,
         allowed_roots=args.allowed_roots,
         working_dir=args.working_dir,
         max_turns=args.max_turns,
     )
-    print(f"Starting Claude Code bridge server on http://127.0.0.1:{args.port}")
-    print("Endpoints:")
-    print(f"  POST /v1/messages              — start a session")
-    print(f"  POST /v1/sessions/<id>/respond — paste Claude's reply")
-    print(f"  GET  /v1/sessions/<id>         — check session status")
-    print(f"  GET  /health                   — health check\n")
-    app.run(host="127.0.0.1", port=args.port, debug=args.debug)
+    print(f"Starting Claude Code API server on http://127.0.0.1:{args.port}")
+    print(f"  Slots:    {args.slots}")
+    print(f"  Headless: {not args.visible}")
+    print(f"  Profile:  {args.browser_profile or '~/.claude-code-wrapper/browser-profile'}\n")
+    uvicorn.run(app, host="127.0.0.1", port=args.port)
 
 
 # ---------- Argument parser ---------- #
@@ -119,12 +121,14 @@ def main() -> None:
     p_run.add_argument("-i", "--interactive", action="store_true")
 
     # --- `claude-code serve` ---
-    p_serve = sub.add_parser("serve", help="Start local API server.")
+    p_serve = sub.add_parser("serve", help="Start local API server with browser automation.")
     p_serve.add_argument("-p", "--port", type=int, default=5050)
+    p_serve.add_argument("-s", "--slots", type=int, default=3, help="Number of API keys / concurrent chats (default: 3).")
+    p_serve.add_argument("--visible", action="store_true", help="Show the browser window (use for first-time login).")
+    p_serve.add_argument("--browser-profile", default=None, help="Path to persistent browser profile directory.")
     p_serve.add_argument("--max-turns", type=int, default=40)
     p_serve.add_argument("--allowed-roots", nargs="*", default=None)
     p_serve.add_argument("--working-dir", default=None)
-    p_serve.add_argument("--debug", action="store_true")
 
     args = parser.parse_args()
 

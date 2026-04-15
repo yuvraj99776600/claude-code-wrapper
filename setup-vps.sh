@@ -46,8 +46,8 @@ echo "    Done."
 # ---- 4. Python environment + install ----
 echo "[4/7] Setting up Python environment..."
 sudo -u claude python3 -m venv /home/claude/venv
-sudo -u claude /home/claude/venv/bin/pip install --upgrade pip setuptools -q
-sudo -u claude /home/claude/venv/bin/pip install -e "$REPO_DIR" -q
+sudo -u claude /home/claude/venv/bin/pip install --upgrade pip setuptools wheel -q
+sudo -u claude /home/claude/venv/bin/pip install /home/claude/claude-code-wrapper -q
 echo "    Done."
 
 # ---- 5. Install Playwright + Chromium ----

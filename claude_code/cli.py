@@ -94,11 +94,16 @@ def cmd_serve(args: argparse.Namespace) -> None:
         allowed_roots=args.allowed_roots,
         working_dir=args.working_dir,
         max_turns=args.max_turns,
+        rate_limit=args.rate_limit,
+        min_delay=args.min_delay,
+        max_delay=args.max_delay,
     )
     print(f"Starting Claude Code API server on http://127.0.0.1:{args.port}")
-    print(f"  Slots:    {args.slots}")
-    print(f"  Headless: {not args.visible}")
-    print(f"  Profile:  {args.browser_profile or '~/.claude-code-wrapper/browser-profile'}\n")
+    print(f"  Slots:      {args.slots}")
+    print(f"  Headless:   {not args.visible}")
+    print(f"  Rate limit: {args.rate_limit} msgs/hour/slot")
+    print(f"  Delay:      {args.min_delay}-{args.max_delay}s between messages")
+    print(f"  Profile:    {args.browser_profile or '~/.claude-code-wrapper/browser-profile'}\n")
     uvicorn.run(app, host="127.0.0.1", port=args.port)
 
 
@@ -127,6 +132,9 @@ def main() -> None:
     p_serve.add_argument("--visible", action="store_true", help="Show the browser window (use for first-time login).")
     p_serve.add_argument("--browser-profile", default=None, help="Path to persistent browser profile directory.")
     p_serve.add_argument("--max-turns", type=int, default=40)
+    p_serve.add_argument("--rate-limit", type=int, default=20, help="Max messages per slot per hour (0=unlimited, default: 20).")
+    p_serve.add_argument("--min-delay", type=float, default=2.0, help="Min seconds between messages on same slot (default: 2.0).")
+    p_serve.add_argument("--max-delay", type=float, default=8.0, help="Max seconds between messages on same slot (default: 8.0).")
     p_serve.add_argument("--allowed-roots", nargs="*", default=None)
     p_serve.add_argument("--working-dir", default=None)
 

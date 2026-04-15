@@ -89,6 +89,9 @@ def create_app(
     allowed_roots: list[str] | None = None,
     working_dir: str | None = None,
     max_turns: int = 40,
+    rate_limit: int = 20,
+    min_delay: float = 2.0,
+    max_delay: float = 8.0,
 ) -> FastAPI:
     global _pool, _ALLOWED_ROOTS, _WORKING_DIR, _MAX_TURNS
 
@@ -103,6 +106,9 @@ def create_app(
             num_slots=num_slots,
             headless=headless,
             browser_profile=browser_profile,
+            rate_limit=rate_limit,
+            min_delay=min_delay,
+            max_delay=max_delay,
         )
         keys = await _pool.start()
 
@@ -112,6 +118,8 @@ def create_app(
         print(f"\n  {num_slots} chat slot(s) ready. Your API keys:\n")
         for i, key in enumerate(keys, 1):
             print(f"    Slot {i}: {key}")
+        print(f"\n  Rate limit: {rate_limit} msgs/hour per slot")
+        print(f"  Delay between messages: {min_delay}-{max_delay}s")
         print(f"\n  Usage:")
         print(f'    curl -X POST http://localhost:PORT/v1/messages \\')
         print(f'      -H "Authorization: Bearer <KEY>" \\')

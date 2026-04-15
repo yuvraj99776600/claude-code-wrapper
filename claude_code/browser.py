@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -202,14 +203,15 @@ class ClaudeBrowser:
         input_el = await page.wait_for_selector(_INPUT_SELECTOR, timeout=15_000)
         await input_el.click()
 
-        # For long messages, use clipboard paste (faster and avoids char limits)
+        # For long messages, use clipboard paste with human-like timing
+        # For short messages, simulate realistic typing
         if len(message) > 500:
             await self._paste_text(page, message)
         else:
-            await input_el.fill(message)
+            await self._human_type(page, input_el, message)
 
-        # Small delay to let the UI register the input
-        await asyncio.sleep(0.3)
+        # Small delay to let the UI register the input (randomized)
+        await asyncio.sleep(random.uniform(0.3, 0.8))
 
         # Click send or press Enter
         await self._click_send(page)
@@ -218,9 +220,28 @@ class ClaudeBrowser:
         response_text = await self._wait_for_response(page, msg_count_before)
         return response_text
 
+    async def _human_type(self, page: Page, input_el: Any, text: str) -> None:
+        """Simulate human-like typing with variable speed and micro-pauses."""
+        for i, char in enumerate(text):
+            await input_el.type(char, delay=0)
+            # Base delay: 30-90ms per character (average human ~50-80ms)
+            delay = random.uniform(0.03, 0.09)
+            # Occasional longer pause after punctuation (thinking)
+            if char in '.!?\n':
+                delay += random.uniform(0.1, 0.4)
+            # Occasional micro-pause mid-word (hesitation)
+            elif random.random() < 0.05:
+                delay += random.uniform(0.08, 0.25)
+            # Slightly faster for spaces (muscle memory)
+            elif char == ' ':
+                delay *= 0.7
+            await asyncio.sleep(delay)
+
     async def _paste_text(self, page: Page, text: str) -> None:
-        """Paste text via clipboard to handle large prompts."""
-        # Use Playwright's built-in clipboard
+        """Paste text via clipboard to handle large prompts with human timing."""
+        # Simulate a brief pause before pasting (like a human copying from somewhere)
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+
         input_el = await page.query_selector(_INPUT_SELECTOR)
         if input_el:
             tag = await input_el.evaluate("el => el.tagName.toLowerCase()")
@@ -234,7 +255,7 @@ class ClaudeBrowser:
                 await input_el.click()
                 await page.keyboard.press("Control+A")
                 await page.keyboard.press("Control+V")
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(random.uniform(0.2, 0.5))
                 # Fallback: dispatch input event with the text directly
                 pasted = await input_el.inner_text()
                 if len(pasted.strip()) < 10:
@@ -242,6 +263,9 @@ class ClaudeBrowser:
                         "(el, text) => { el.innerText = text; el.dispatchEvent(new Event('input', {bubbles: true})); }",
                         text,
                     )
+
+        # Small pause after pasting before hitting send (like reviewing)
+        await asyncio.sleep(random.uniform(0.3, 1.0))
 
     async def _click_send(self, page: Page) -> None:
         """Click the send button, falling back to Enter key."""

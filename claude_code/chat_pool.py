@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import secrets
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +30,10 @@ class ChatSlot:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     busy: bool = False
     message_count: int = 0
+    # Rate limiting: timestamps of recent messages (rolling 1-hour window)
+    _send_times: deque = field(default_factory=lambda: deque(maxlen=200))
+    # Track when last message was sent for inter-message delay
+    _last_send: float = 0.0
 
 
 class ChatPool:
@@ -40,6 +47,12 @@ class ChatPool:
         Run Chromium headless (False for first-time login).
     browser_profile : str | None
         Path to persistent browser profile directory.
+    rate_limit : int
+        Maximum messages per slot per hour (0 = unlimited).
+    min_delay : float
+        Minimum seconds to wait between messages on the same slot.
+    max_delay : float
+        Maximum seconds to wait between messages on the same slot.
     """
 
     def __init__(
@@ -47,9 +60,15 @@ class ChatPool:
         num_slots: int = 3,
         headless: bool = True,
         browser_profile: str | None = None,
+        rate_limit: int = 20,
+        min_delay: float = 2.0,
+        max_delay: float = 8.0,
     ) -> None:
         self.num_slots = num_slots
         self.headless = headless
+        self.rate_limit = rate_limit
+        self.min_delay = min_delay
+        self.max_delay = max_delay
 
         self._browser = ClaudeBrowser(
             headless=headless,
@@ -101,11 +120,17 @@ class ChatPool:
         return self._slots.get(api_key)
 
     def list_keys(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        cutoff = now - 3600
         return [
             {
                 "api_key": slot.api_key,
                 "busy": slot.busy,
                 "messages_sent": slot.message_count,
+                "messages_last_hour": sum(
+                    1 for t in slot._send_times if t > cutoff
+                ),
+                "rate_limit": self.rate_limit,
             }
             for slot in self._slots.values()
         ]
@@ -118,6 +143,7 @@ class ChatPool:
         """Send a message on the slot's Claude chat and return the response.
 
         Serialized: if the slot is busy, this waits for the lock.
+        Applies rate limiting and random inter-message delays.
         """
         slot = self._slots.get(api_key)
         if not slot:
@@ -127,10 +153,42 @@ class ChatPool:
             slot.page = await self._browser.new_chat_page()
 
         async with slot.lock:
+            # --- Rate limiting: check rolling 1-hour window ---
+            if self.rate_limit > 0:
+                now = time.monotonic()
+                cutoff = now - 3600  # 1 hour ago
+                # Remove timestamps older than 1 hour
+                while slot._send_times and slot._send_times[0] < cutoff:
+                    slot._send_times.popleft()
+                if len(slot._send_times) >= self.rate_limit:
+                    wait_until = slot._send_times[0] + 3600
+                    wait_secs = wait_until - now
+                    log.warning(
+                        "Slot %s... rate limited. %d msgs in last hour (limit: %d). "
+                        "Waiting %.0fs.",
+                        api_key[:12], len(slot._send_times),
+                        self.rate_limit, wait_secs,
+                    )
+                    await asyncio.sleep(wait_secs)
+
+            # --- Random inter-message delay ---
+            if slot._last_send > 0:
+                elapsed = time.monotonic() - slot._last_send
+                desired_delay = random.uniform(self.min_delay, self.max_delay)
+                if elapsed < desired_delay:
+                    wait = desired_delay - elapsed
+                    log.debug(
+                        "Slot %s... waiting %.1fs before next message.",
+                        api_key[:12], wait,
+                    )
+                    await asyncio.sleep(wait)
+
             slot.busy = True
             try:
                 response = await self._browser.send_message(slot.page, message)
                 slot.message_count += 1
+                slot._send_times.append(time.monotonic())
+                slot._last_send = time.monotonic()
                 return response
             finally:
                 slot.busy = False

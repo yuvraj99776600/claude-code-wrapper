@@ -92,6 +92,18 @@ class ClaudeBrowser:
     #  Lifecycle                                                       #
     # ---------------------------------------------------------------- #
 
+    @staticmethod
+    def _parse_proxy(url: str) -> dict[str, str]:
+        """Parse ``http://user:pass@host:port`` into Playwright proxy dict."""
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        cfg: dict[str, str] = {"server": f"{p.scheme}://{p.hostname}:{p.port}"}
+        if p.username:
+            cfg["username"] = p.username
+        if p.password:
+            cfg["password"] = p.password
+        return cfg
+
     async def start(self) -> None:
         """Launch browser and restore saved login session."""
         self._pw = await async_playwright().start()
@@ -106,10 +118,11 @@ class ClaudeBrowser:
             ],
         }
 
-        # Proxy support
+        # Proxy support — split embedded credentials for Playwright
         if self.proxy:
-            launch_kwargs["proxy"] = {"server": self.proxy}
-            log.info("Using proxy: %s", self.proxy.split("@")[-1] if "@" in self.proxy else self.proxy)
+            proxy_cfg = self._parse_proxy(self.proxy)
+            launch_kwargs["proxy"] = proxy_cfg
+            log.info("Using proxy: %s", proxy_cfg["server"])
 
         # Timezone / locale spoofing
         if self.timezone:

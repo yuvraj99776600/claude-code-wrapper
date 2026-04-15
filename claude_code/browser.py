@@ -59,6 +59,12 @@ class ClaudeBrowser:
         Defaults to ``~/.claude-code-wrapper/browser-profile``.
     slow_mo : int
         Milliseconds to slow down each Playwright action (helps avoid detection).
+    proxy : str | None
+        Proxy URL, e.g. ``http://user:pass@host:port`` or ``socks5://host:port``.
+    timezone : str | None
+        Timezone ID to spoof, e.g. ``America/New_York``. Defaults to system tz.
+    locale : str | None
+        Locale to spoof, e.g. ``en-US``. Defaults to system locale.
     """
 
     def __init__(
@@ -66,11 +72,17 @@ class ClaudeBrowser:
         headless: bool = True,
         profile_dir: str | Path | None = None,
         slow_mo: int = 50,
+        proxy: str | None = None,
+        timezone: str | None = None,
+        locale: str | None = None,
     ) -> None:
         self.headless = headless
         self.profile_dir = Path(profile_dir) if profile_dir else PROFILE_DIR
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.slow_mo = slow_mo
+        self.proxy = proxy
+        self.timezone = timezone
+        self.locale = locale
 
         self._pw: Playwright | None = None
         self._browser: Browser | None = None
@@ -83,15 +95,29 @@ class ClaudeBrowser:
     async def start(self) -> None:
         """Launch browser and restore saved login session."""
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_dir),
-            headless=self.headless,
-            slow_mo=self.slow_mo,
-            viewport={"width": 1280, "height": 900},
-            args=[
+
+        launch_kwargs: dict[str, Any] = {
+            "user_data_dir": str(self.profile_dir),
+            "headless": self.headless,
+            "slow_mo": self.slow_mo,
+            "viewport": {"width": 1280, "height": 900},
+            "args": [
                 "--disable-blink-features=AutomationControlled",
             ],
-        )
+        }
+
+        # Proxy support
+        if self.proxy:
+            launch_kwargs["proxy"] = {"server": self.proxy}
+            log.info("Using proxy: %s", self.proxy.split("@")[-1] if "@" in self.proxy else self.proxy)
+
+        # Timezone / locale spoofing
+        if self.timezone:
+            launch_kwargs["timezone_id"] = self.timezone
+        if self.locale:
+            launch_kwargs["locale"] = self.locale
+
+        self._browser = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
         self._context = self._browser
         log.info("Browser started (headless=%s, profile=%s)", self.headless, self.profile_dir)
 

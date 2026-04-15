@@ -53,6 +53,12 @@ class ChatPool:
         Minimum seconds to wait between messages on the same slot.
     max_delay : float
         Maximum seconds to wait between messages on the same slot.
+    proxy : str | None
+        Proxy URL for browser traffic (e.g. http://user:pass@host:port).
+    timezone : str | None
+        Timezone to spoof (e.g. America/New_York).
+    locale : str | None
+        Locale to spoof (e.g. en-US).
     """
 
     def __init__(
@@ -63,6 +69,9 @@ class ChatPool:
         rate_limit: int = 20,
         min_delay: float = 2.0,
         max_delay: float = 8.0,
+        proxy: str | None = None,
+        timezone: str | None = None,
+        locale: str | None = None,
     ) -> None:
         self.num_slots = num_slots
         self.headless = headless
@@ -73,6 +82,9 @@ class ChatPool:
         self._browser = ClaudeBrowser(
             headless=headless,
             profile_dir=browser_profile,
+            proxy=proxy,
+            timezone=timezone,
+            locale=locale,
         )
         self._slots: dict[str, ChatSlot] = {}
         self._started = False

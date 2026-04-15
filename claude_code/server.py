@@ -92,6 +92,9 @@ def create_app(
     rate_limit: int = 20,
     min_delay: float = 2.0,
     max_delay: float = 8.0,
+    proxy: str | None = None,
+    timezone: str | None = None,
+    locale: str | None = None,
 ) -> FastAPI:
     global _pool, _ALLOWED_ROOTS, _WORKING_DIR, _MAX_TURNS
 
@@ -109,6 +112,9 @@ def create_app(
             rate_limit=rate_limit,
             min_delay=min_delay,
             max_delay=max_delay,
+            proxy=proxy,
+            timezone=timezone,
+            locale=locale,
         )
         keys = await _pool.start()
 
@@ -120,6 +126,11 @@ def create_app(
             print(f"    Slot {i}: {key}")
         print(f"\n  Rate limit: {rate_limit} msgs/hour per slot")
         print(f"  Delay between messages: {min_delay}-{max_delay}s")
+        if proxy:
+            masked = proxy.split("@")[-1] if "@" in proxy else proxy
+            print(f"  Proxy: {masked}")
+        if timezone:
+            print(f"  Timezone: {timezone}")
         print(f"\n  Usage:")
         print(f'    curl -X POST http://localhost:PORT/v1/messages \\')
         print(f'      -H "Authorization: Bearer <KEY>" \\')

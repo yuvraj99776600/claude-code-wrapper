@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import time
 from pathlib import Path
@@ -183,6 +184,75 @@ class ClaudeBrowser:
         raise TimeoutError("Login timed out after 10 minutes.")
 
     # ---------------------------------------------------------------- #
+    #  Human-like mouse movement                                       #
+    # ---------------------------------------------------------------- #
+
+    async def _human_move_to(self, page: Page, x: float, y: float) -> None:
+        """Move the mouse to (x, y) along a Bézier curve with variable speed."""
+        # Get current mouse position (default to a random starting point)
+        start_x = getattr(self, '_mouse_x', random.uniform(200, 800))
+        start_y = getattr(self, '_mouse_y', random.uniform(200, 600))
+
+        # Generate 1-2 random control points for a Bézier curve
+        cp1_x = start_x + (x - start_x) * random.uniform(0.2, 0.5) + random.uniform(-80, 80)
+        cp1_y = start_y + (y - start_y) * random.uniform(0.2, 0.5) + random.uniform(-80, 80)
+        cp2_x = start_x + (x - start_x) * random.uniform(0.5, 0.8) + random.uniform(-40, 40)
+        cp2_y = start_y + (y - start_y) * random.uniform(0.5, 0.8) + random.uniform(-40, 40)
+
+        # Number of steps based on distance (more distance = more steps)
+        dist = math.hypot(x - start_x, y - start_y)
+        steps = max(8, min(35, int(dist / 15)))
+
+        for i in range(steps + 1):
+            t = i / steps
+            # Ease-in-out: slow start, fast middle, slow end
+            t = t * t * (3 - 2 * t)
+            # Cubic Bézier
+            u = 1 - t
+            bx = u**3 * start_x + 3 * u**2 * t * cp1_x + 3 * u * t**2 * cp2_x + t**3 * x
+            by = u**3 * start_y + 3 * u**2 * t * cp1_y + 3 * u * t**2 * cp2_y + t**3 * y
+            await page.mouse.move(bx, by)
+            # Variable speed: slower at start and end
+            await asyncio.sleep(random.uniform(0.005, 0.02))
+
+        # Small overshoot correction (humans often slightly overshoot)
+        if random.random() < 0.3:
+            overshoot_x = x + random.uniform(-3, 3)
+            overshoot_y = y + random.uniform(-3, 3)
+            await page.mouse.move(overshoot_x, overshoot_y)
+            await asyncio.sleep(random.uniform(0.02, 0.06))
+            await page.mouse.move(x, y)
+
+        self._mouse_x = x
+        self._mouse_y = y
+
+    async def _human_click(self, page: Page, element: Any) -> None:
+        """Move mouse to element with human-like motion, then click."""
+        box = await element.bounding_box()
+        if not box:
+            await element.click()
+            return
+
+        # Click at a random point within the element (not dead center)
+        target_x = box['x'] + box['width'] * random.uniform(0.25, 0.75)
+        target_y = box['y'] + box['height'] * random.uniform(0.3, 0.7)
+
+        await self._human_move_to(page, target_x, target_y)
+        await asyncio.sleep(random.uniform(0.05, 0.15))  # brief pause before click
+        await page.mouse.click(target_x, target_y)
+
+    async def _idle_mouse_wander(self, page: Page) -> None:
+        """Small random mouse movements to simulate reading / waiting."""
+        viewport = page.viewport_size or {'width': 1280, 'height': 900}
+        # Move to a random spot in the content area
+        x = random.uniform(200, viewport['width'] - 100)
+        y = random.uniform(150, viewport['height'] - 100)
+        await self._human_move_to(page, x, y)
+        # Sometimes do a small scroll
+        if random.random() < 0.3:
+            await page.mouse.wheel(0, random.uniform(-60, 120))
+
+    # ---------------------------------------------------------------- #
     #  Send / receive                                                  #
     # ---------------------------------------------------------------- #
 
@@ -201,7 +271,7 @@ class ClaudeBrowser:
 
         # Focus and fill the input
         input_el = await page.wait_for_selector(_INPUT_SELECTOR, timeout=15_000)
-        await input_el.click()
+        await self._human_click(page, input_el)
 
         # For long messages, use clipboard paste with human-like timing
         # For short messages, simulate realistic typing
@@ -268,7 +338,7 @@ class ClaudeBrowser:
         await asyncio.sleep(random.uniform(0.3, 1.0))
 
     async def _click_send(self, page: Page) -> None:
-        """Click the send button, falling back to Enter key."""
+        """Click the send button with human-like mouse movement, falling back to Enter key."""
         for selector in [
             _SEND_BUTTON_SELECTOR,
             'button[type="submit"]',
@@ -276,7 +346,7 @@ class ClaudeBrowser:
             try:
                 btn = await page.query_selector(selector)
                 if btn and await btn.is_enabled():
-                    await btn.click()
+                    await self._human_click(page, btn)
                     return
             except Exception:
                 continue
@@ -301,7 +371,8 @@ class ClaudeBrowser:
         else:
             raise TimeoutError(f"No new assistant message after {timeout}s")
 
-        # Phase 2: wait for streaming to stop
+        # Phase 2: wait for streaming to stop (with idle mouse activity)
+        idle_counter = 0
         while time.monotonic() - start < timeout:
             is_streaming = await page.query_selector(_STREAMING_INDICATOR)
             if not is_streaming:
@@ -310,6 +381,10 @@ class ClaudeBrowser:
                 is_streaming = await page.query_selector(_STREAMING_INDICATOR)
                 if not is_streaming:
                     break
+            # Occasional idle mouse movement while waiting (like reading)
+            idle_counter += 1
+            if idle_counter % 8 == 0 and random.random() < 0.5:
+                await self._idle_mouse_wander(page)
             await asyncio.sleep(0.5)
 
         # Phase 3: extract the last assistant message

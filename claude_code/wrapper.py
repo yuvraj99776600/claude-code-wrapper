@@ -1,62 +1,51 @@
-"""Core wrapper that drives the multi-turn agentic conversation with Claude."""
+"""Clipboard-bridge wrapper — manages the multi-turn agentic loop via copy/paste.
+
+No Anthropic API key required.  Uses your Claude Pro web account instead.
+"""
 
 from __future__ import annotations
 
-import json
 import os
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-import anthropic
+from .prompt_builder import build_initial_prompt, build_tool_results_prompt
+from .parser import parse_response, ParsedResponse
+from .tools import dispatch_tool
 
-from .tools import TOOL_DEFINITIONS, dispatch_tool
 
-
-# ---------- defaults ----------
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
-MAX_TURNS = 40  # safety limit on agentic loops
-MAX_TOKENS = 16_384
+MAX_TURNS = 40
 
 
 class ClaudeCodeWrapper:
-    """Drive a multi-turn, tool-using conversation with Claude.
+    """Drive a multi-turn, tool-using conversation by copy/pasting to claude.ai.
 
     Parameters
     ----------
-    api_key : str | None
-        Anthropic API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
-    model : str
-        Model identifier to use for every Messages API call.
     allowed_roots : list[str] | None
-        Directories the tools are allowed to read/write.  Defaults to cwd.
+        Directories the tools are allowed to access.  Defaults to cwd.
     working_dir : str | None
-        Working directory for shell commands.  Defaults to the first
-        allowed root.
+        Working directory for shell commands.
     max_turns : int
-        Maximum number of assistant→tool round trips before stopping.
-    max_tokens : int
-        ``max_tokens`` passed to each Messages API call.
-    system_prompt : str | None
-        Optional system prompt override.
+        Safety cap on agentic round-trips.
+    auto_copy : bool
+        If True, automatically copy prompts to the system clipboard.
     """
 
     def __init__(
         self,
-        api_key: str | None = None,
-        model: str = DEFAULT_MODEL,
         allowed_roots: list[str] | None = None,
         working_dir: str | None = None,
         max_turns: int = MAX_TURNS,
-        max_tokens: int = MAX_TOKENS,
-        system_prompt: str | None = None,
+        auto_copy: bool = True,
     ) -> None:
-        self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
-        self.model = model
-        self.allowed_roots = [str(Path(r).resolve()) for r in (allowed_roots or [os.getcwd()])]
+        self.allowed_roots = [
+            str(Path(r).resolve()) for r in (allowed_roots or [os.getcwd()])
+        ]
         self.working_dir = working_dir or self.allowed_roots[0]
         self.max_turns = max_turns
-        self.max_tokens = max_tokens
-        self.system_prompt = system_prompt or self._default_system_prompt()
+        self.auto_copy = auto_copy
 
     # ------------------------------------------------------------------ #
     #  Public API                                                        #
@@ -67,129 +56,125 @@ class ClaudeCodeWrapper:
         prompt: str,
         file_paths: list[str] | None = None,
         *,
-        on_tool_call: Any | None = None,
-        on_text: Any | None = None,
+        get_response: Callable[[], str] | None = None,
+        on_tool_call: Callable[[str, dict, str], None] | None = None,
+        on_prompt_ready: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
-        """Execute a full agentic session.
+        """Run the full agentic loop.
 
         Parameters
         ----------
         prompt : str
-            Natural-language instruction.
+            Natural-language task.
         file_paths : list[str] | None
-            Files to pre-load into the conversation context.
+            Files to inject into the first message.
+        get_response : callable
+            A function that returns Claude's raw response text.
+            Defaults to clipboard-based input (waits for paste).
         on_tool_call : callable | None
-            ``(tool_name, tool_input, tool_result) -> None`` callback.
-        on_text : callable | None
-            ``(text_chunk) -> None`` callback for streamed assistant text.
+            ``(tool_name, tool_input, result) -> None`` progress callback.
+        on_prompt_ready : callable | None
+            ``(formatted_prompt) -> None`` called when a prompt is ready
+            to be pasted.  Receives the full text.
 
         Returns
         -------
-        dict with keys ``text``, ``tool_results``, ``messages``, ``turns``.
+        dict  ``{"text", "tool_results", "turns"}``
         """
-        messages = self._build_initial_messages(prompt, file_paths or [])
-        tool_results: list[dict[str, Any]] = []
-        final_text_parts: list[str] = []
+        if get_response is None:
+            get_response = self._default_get_response
+
+        # --- Turn 0: initial prompt ---
+        outgoing = build_initial_prompt(prompt, file_paths)
+        all_tool_results: list[dict[str, Any]] = []
+        final_text = ""
 
         for turn in range(self.max_turns):
-            response = self._call_api(messages)
+            # Present the prompt to the user
+            self._deliver_prompt(outgoing, on_prompt_ready)
 
-            # Collect text blocks
-            text_blocks = [b.text for b in response.content if b.type == "text"]
-            if text_blocks:
-                combined = "\n".join(text_blocks)
-                final_text_parts.append(combined)
-                if on_text:
-                    on_text(combined)
+            # Get Claude's response (pasted back by the user)
+            raw_response = get_response()
+            parsed = parse_response(raw_response)
 
-            # If no tool use, conversation is done
-            if response.stop_reason != "tool_use":
+            # Always capture text
+            if parsed.text:
+                final_text = parsed.text
+
+            # If no tool calls, we're done
+            if not parsed.has_tool_calls:
                 break
 
-            # Process every tool_use block in the response
-            tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
-            tool_result_contents: list[dict[str, Any]] = []
-
-            for tool_block in tool_use_blocks:
+            # Execute each tool call locally
+            turn_results: list[dict[str, Any]] = []
+            for tc in parsed.tool_calls:
                 result_str = dispatch_tool(
-                    tool_name=tool_block.name,
-                    tool_input=tool_block.input,
+                    tool_name=tc.tool,
+                    tool_input=tc.params,
                     allowed_roots=self.allowed_roots,
                     working_dir=self.working_dir,
                 )
-                tool_entry = {
-                    "tool_name": tool_block.name,
-                    "tool_input": tool_block.input,
+                entry = {
+                    "tool_name": tc.tool,
+                    "tool_input": tc.params,
                     "result": result_str,
                 }
-                tool_results.append(tool_entry)
+                turn_results.append(entry)
+                all_tool_results.append(entry)
 
                 if on_tool_call:
-                    on_tool_call(tool_block.name, tool_block.input, result_str)
+                    on_tool_call(tc.tool, tc.params, result_str)
 
-                tool_result_contents.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content": result_str,
-                })
-
-            # Append the assistant turn and all tool results
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_result_contents})
+            # Build follow-up prompt with results
+            outgoing = build_tool_results_prompt(turn_results)
 
         return {
-            "text": "\n".join(final_text_parts),
-            "tool_results": tool_results,
-            "messages": messages,
+            "text": final_text,
+            "tool_results": all_tool_results,
             "turns": turn + 1 if 'turn' in dir() else 0,
         }
 
     # ------------------------------------------------------------------ #
-    #  Internals                                                         #
+    #  Clipboard helpers                                                 #
     # ------------------------------------------------------------------ #
 
-    def _call_api(self, messages: list[dict]) -> Any:
-        """Make a single Messages API call with tools."""
-        return self.client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            system=self.system_prompt,
-            tools=TOOL_DEFINITIONS,
-            messages=messages,
-        )
-
-    def _build_initial_messages(
-        self, prompt: str, file_paths: list[str]
-    ) -> list[dict[str, Any]]:
-        """Build the first user message, optionally pre-loading files."""
-        parts: list[str] = []
-
-        if file_paths:
-            parts.append("Here are the files in the project:\n")
-            for fp in file_paths:
-                resolved = str(Path(fp).resolve())
-                try:
-                    content = Path(resolved).read_text(encoding="utf-8")
-                    parts.append(f"--- {fp} ---\n{content}\n")
-                except Exception as exc:
-                    parts.append(f"--- {fp} ---\n[Could not read: {exc}]\n")
-
-        parts.append(f"\n{prompt}")
-
-        return [{"role": "user", "content": "\n".join(parts)}]
+    def _deliver_prompt(
+        self,
+        text: str,
+        on_prompt_ready: Callable[[str], None] | None,
+    ) -> None:
+        """Copy *text* to clipboard (if auto_copy) and notify callback."""
+        if self.auto_copy:
+            try:
+                import pyperclip
+                pyperclip.copy(text)
+            except ImportError:
+                pass  # pyperclip not installed; user copies manually
+        if on_prompt_ready:
+            on_prompt_ready(text)
 
     @staticmethod
-    def _default_system_prompt() -> str:
-        return (
-            "You are Claude Code, an expert software engineer. "
-            "You have access to tools that let you read files, write files, "
-            "and execute shell commands on the user's machine.\n\n"
-            "Guidelines:\n"
-            "- Read files before modifying them to understand existing code.\n"
-            "- Write complete file contents when using write_file (no placeholders).\n"
-            "- Use execute_shell_command for running tests, installing deps, git, etc.\n"
-            "- Be precise and minimal — only change what the user asked for.\n"
-            "- If you need to explore the project, use shell commands like "
-            "'find . -type f' or 'ls -la'.\n"
-            "- After completing the task, summarize what you did.\n"
-        )
+    def _default_get_response() -> str:
+        """Wait for the user to paste Claude's response via stdin."""
+        print("\n" + "=" * 60)
+        print("  Paste Claude's response below, then press Enter twice:")
+        print("=" * 60)
+        lines: list[str] = []
+        empty_count = 0
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if line == "":
+                empty_count += 1
+                if empty_count >= 2:
+                    break
+            else:
+                # Reset counter if we saw a non-empty line (single blank
+                # lines in code blocks are fine)
+                if empty_count == 1:
+                    lines.append("")
+                empty_count = 0
+                lines.append(line)
+        return "\n".join(lines)

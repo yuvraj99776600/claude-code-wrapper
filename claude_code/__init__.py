@@ -1,8 +1,16 @@
-"""Claude Code - A Python API wrapper that provides an agentic coding experience using Anthropic's Messages API."""
+"""Claude Code - Clipboard-bridge wrapper that turns your Claude Pro web account into a local API."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .wrapper import ClaudeCodeWrapper
-from .tools import TOOL_DEFINITIONS
+from .parser import parse_response, ParsedResponse, ToolCall
+from .tools import TOOL_DEFINITIONS, dispatch_tool
 
-__all__ = ["ClaudeCodeWrapper", "TOOL_DEFINITIONS"]
+__all__ = [
+    "ClaudeCodeWrapper",
+    "parse_response",
+    "ParsedResponse",
+    "ToolCall",
+    "TOOL_DEFINITIONS",
+    "dispatch_tool",
+]

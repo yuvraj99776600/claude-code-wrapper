@@ -4,12 +4,13 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "claude-code-wrapper"
-version = "0.1.0"
-description = "Python API wrapper that gives Claude agentic file-system and shell tools via the Messages API."
+version = "0.2.0"
+description = "Clipboard-bridge that turns your Claude Pro web account into a local API with file-system and shell tools."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=0.39.0",
+    "flask>=3.0",
+    "pyperclip>=1.8",
 ]
 
 [project.scripts]

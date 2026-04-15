@@ -1,29 +1,53 @@
 # Claude Code Wrapper
 
-A Python API wrapper around Anthropic's Messages API that gives Claude **read_file**, **write_file**, and **execute_shell_command** tools — turning it into an agentic coding assistant that can autonomously explore, modify, and run code on your machine.
+A clipboard-bridge that turns your **Claude Pro web account** into a local API with agentic file-system and shell tools. **No API key needed.**
 
-## Features
+## How it works
 
-- **Multi-turn tool loop** — Claude calls tools, receives results, and continues until the task is done (up to a configurable turn limit).
-- **File-path pre-loading** — Pass a list of files and they are injected into the first message so Claude has immediate context.
-- **Sandbox validation** — All file reads/writes are checked against an allowed-roots list to prevent escaping the project directory.
-- **Destructive-command guard** — A blocklist prevents accidentally running `rm -rf /` and friends.
-- **CLI & library** — Use it from the command line or import `ClaudeCodeWrapper` in your own Python code.
+```
+Your code ──POST──▸ Local server ──formats prompt──▸ Clipboard
+                                                        │
+                                                        ▼
+                                                   claude.ai
+                                                   (you paste)
+                                                        │
+                                                        ▼
+Your code ◂──result── Local server ◂──you paste── Claude's reply
+                         │
+                    executes tools
+                    (read/write/shell)
+                         │
+                    formats results ──▸ Clipboard ──▸ claude.ai ...
+```
+
+1. You send a request to `http://localhost:5050/v1/messages`
+2. The server builds a prompt with tool definitions and copies it to your clipboard
+3. You paste it into claude.ai and copy Claude's response
+4. You POST the response back to `/v1/sessions/<id>/respond`
+5. The server parses tool calls, executes them locally, and gives you the next prompt
+6. Repeat until Claude responds with no tool calls (task complete)
 
 ## Quick start
 
 ```bash
-# Install
 pip install -e .
 
-# Set your API key
-export ANTHROPIC_API_KEY="sk-ant-..."
+# --- Option A: Local API server ---
+claude-code serve
 
-# One-shot
-claude-code "Add type hints to utils.py" -f src/utils.py
+# In another terminal, start a session:
+curl -X POST http://localhost:5050/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Add error handling to main.py", "file_paths": ["main.py"]}'
 
-# Interactive
-claude-code -i
+# Paste the returned "prompt" into claude.ai, copy the response, then:
+curl -X POST http://localhost:5050/v1/sessions/<SESSION_ID>/respond \
+  -H "Content-Type: application/json" \
+  -d '{"response": "<paste Claude response here>"}'
+
+# --- Option B: Interactive CLI ---
+claude-code run -i
+claude-code run "Fix the tests" -f tests/test_app.py src/app.py
 ```
 
 ## Library usage
@@ -31,53 +55,69 @@ claude-code -i
 ```python
 from claude_code import ClaudeCodeWrapper
 
-wrapper = ClaudeCodeWrapper(
-    allowed_roots=["./my-project"],
-    model="claude-sonnet-4-20250514",
-)
+wrapper = ClaudeCodeWrapper(allowed_roots=["./my-project"])
+
+# Provide your own response callback (e.g. integrate with a UI)
+def get_response():
+    return input("Paste Claude's response: ")
 
 result = wrapper.run(
-    prompt="Refactor the database module to use async/await",
-    file_paths=["src/db.py", "src/models.py"],
+    prompt="Refactor the database module",
+    file_paths=["src/db.py"],
+    get_response=get_response,
 )
 
-print(result["text"])           # Final assistant response
-print(result["tool_results"])   # List of every tool call + result
-print(result["turns"])          # Number of API round trips
+print(result["text"])           # Final answer
+print(result["tool_results"])   # Every tool call + result
+print(result["turns"])          # Number of round trips
 ```
 
-## CLI flags
+## API endpoints
 
-| Flag | Description |
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/messages` | Start a new session. Body: `{"prompt": "...", "file_paths": [...]}` |
+| `POST` | `/v1/sessions/<id>/respond` | Send Claude's response. Body: `{"response": "..."}` |
+| `GET` | `/v1/sessions/<id>` | Check session status and history |
+| `GET` | `/health` | Server health check |
+
+## CLI commands
+
+| Command | Description |
 |---|---|
-| `prompt` | Natural-language instruction (positional) |
-| `-f / --files` | Files to pre-load into context |
-| `-m / --model` | Model identifier (default `claude-sonnet-4-20250514`) |
-| `--max-turns` | Max tool round trips (default 40) |
-| `--allowed-roots` | Directories tools may access (default cwd) |
-| `--working-dir` | Shell command working directory |
-| `-i / --interactive` | Stay in a prompt loop after the first task |
-| `--json` | Emit structured JSON output |
+| `claude-code run [prompt]` | Interactive clipboard-bridge mode |
+| `claude-code run -f file1 file2` | Pre-load files |
+| `claude-code serve` | Start the local HTTP API server |
+| `claude-code serve -p 8080` | Custom port |
 
 ## Architecture
 
 ```
 claude_code/
-├── __init__.py      # Package exports
-├── wrapper.py       # ClaudeCodeWrapper — drives the multi-turn loop
-├── tools.py         # Tool schemas, sandbox validation, handlers
-└── cli.py           # Command-line interface
+├── __init__.py          # Package exports
+├── wrapper.py           # ClaudeCodeWrapper — multi-turn clipboard loop
+├── tools.py             # Tool handlers (read_file, write_file, shell) + sandbox
+├── parser.py            # Extracts ```tool_call blocks from Claude's text
+├── prompt_builder.py    # Formats prompts with tool protocol for pasting
+├── server.py            # Flask API server with session management
+└── cli.py               # CLI entry point (run / serve)
 ```
 
-### Conversation flow
+## Tool-call protocol
 
-1. The user's prompt (+ pre-loaded files) is sent as the first `user` message.
-2. The Messages API returns either **text** (done) or **tool_use** blocks.
-3. Each tool_use block is dispatched to its handler; results are sent back as `tool_result` blocks.
-4. Steps 2-3 repeat until Claude responds with only text or the turn limit is hit.
+Claude is instructed to emit tool calls as fenced JSON blocks:
 
-## Security notes
+~~~
+```tool_call
+{"tool": "read_file", "params": {"path": "src/main.py"}}
+```
+~~~
 
-- File operations are sandboxed to `--allowed-roots` (defaults to cwd).
-- A static blocklist prevents the most dangerous shell commands.
-- **This is not a security boundary** — treat it the same way you'd treat giving someone SSH access. Review the `--allowed-roots` you set.
+The wrapper parses these, executes them locally, and sends results back as `tool_result` blocks in the next prompt. This continues until Claude responds with plain text only.
+
+## Security
+
+- File operations are sandboxed to `--allowed-roots` (defaults to cwd)
+- Destructive shell commands are blocked by a static pattern list
+- The server only binds to `127.0.0.1` — not exposed to the network
+- **Treat this like giving someone shell access** — review your allowed roots

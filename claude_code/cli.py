@@ -1,138 +1,141 @@
-"""CLI entry point for Claude Code wrapper."""
+"""CLI entry point — interactive clipboard-bridge mode and local API server."""
 
 import argparse
 import os
 import sys
-import json
 
 from .wrapper import ClaudeCodeWrapper
 
 
-def _print_tool_call(name: str, inputs: dict, result: str) -> None:
-    """Pretty-print a tool invocation."""
+# ---------- Pretty callbacks ---------- #
+
+def _on_tool_call(name: str, inputs: dict, result: str) -> None:
     print(f"\n{'─' * 60}")
-    print(f"  🔧 {name}")
-    if name == "read_file":
-        print(f"     path: {inputs.get('path')}")
-    elif name == "write_file":
-        print(f"     path: {inputs.get('path')}")
-        print(f"     size: {len(inputs.get('content', ''))} chars")
-    elif name == "execute_shell_command":
-        print(f"     cmd:  {inputs.get('command')}")
-    # Truncate long results for display
-    preview = result[:500] + ("…" if len(result) > 500 else "")
-    print(f"     result: {preview}")
+    label = {
+        "read_file": f"  READ   {inputs.get('path', '')}",
+        "write_file": f"  WRITE  {inputs.get('path', '')}",
+        "execute_shell_command": f"  SHELL  {inputs.get('command', '')[:70]}",
+    }.get(name, f"  TOOL   {name}")
+    print(label)
+    preview = result[:400] + ("…" if len(result) > 400 else "")
+    print(f"  result: {preview}")
     print(f"{'─' * 60}")
 
 
-def _print_text(text: str) -> None:
-    """Print assistant text as it arrives."""
-    print(text)
+def _on_prompt_ready(prompt: str) -> None:
+    """Show the user that a prompt is ready (clipboard or manual)."""
+    try:
+        import pyperclip
+        pyperclip.copy(prompt)
+        print("\n>>> Prompt COPIED to clipboard. Paste it into claude.ai.")
+    except ImportError:
+        # Fallback: print the prompt so the user can copy manually
+        print("\n" + "=" * 60)
+        print("  Copy the prompt below and paste it into claude.ai:")
+        print("=" * 60)
+        print(prompt)
+        print("=" * 60)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="claude-code",
-        description="Run an agentic coding session with Claude.",
-    )
-    parser.add_argument(
-        "prompt",
-        nargs="?",
-        help="Natural-language instruction for Claude.",
-    )
-    parser.add_argument(
-        "-f", "--files",
-        nargs="*",
-        default=[],
-        help="File paths to pre-load into the conversation context.",
-    )
-    parser.add_argument(
-        "-m", "--model",
-        default="claude-sonnet-4-20250514",
-        help="Anthropic model to use (default: claude-sonnet-4-20250514).",
-    )
-    parser.add_argument(
-        "--max-turns",
-        type=int,
-        default=40,
-        help="Maximum tool-use round trips (default: 40).",
-    )
-    parser.add_argument(
-        "--allowed-roots",
-        nargs="*",
-        default=None,
-        help="Directories the tools may access (default: cwd).",
-    )
-    parser.add_argument(
-        "--working-dir",
-        default=None,
-        help="Working directory for shell commands.",
-    )
-    parser.add_argument(
-        "-i", "--interactive",
-        action="store_true",
-        help="Enter interactive (multi-session) mode after the first prompt.",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        help="Output the full result as JSON instead of pretty-printing.",
-    )
-    args = parser.parse_args()
+# ---------- Commands ---------- #
 
-    if not args.prompt and not args.interactive:
-        parser.print_help()
-        sys.exit(1)
-
+def cmd_run(args: argparse.Namespace) -> None:
+    """One-shot or interactive clipboard-bridge mode."""
     wrapper = ClaudeCodeWrapper(
-        model=args.model,
         allowed_roots=args.allowed_roots,
         working_dir=args.working_dir,
         max_turns=args.max_turns,
+        auto_copy=True,
     )
 
-    def _run_prompt(prompt: str, files: list[str]) -> None:
-        if args.json_output:
-            result = wrapper.run(prompt, files)
-            # messages contain Anthropic SDK objects; serialize text/tool_results only
-            print(json.dumps({
-                "text": result["text"],
-                "tool_results": result["tool_results"],
-                "turns": result["turns"],
-            }, indent=2))
-        else:
-            print(f"\n{'━' * 60}")
-            print(f"  Prompt: {prompt[:120]}{'…' if len(prompt) > 120 else ''}")
-            print(f"{'━' * 60}\n")
-            result = wrapper.run(
-                prompt,
-                files,
-                on_tool_call=_print_tool_call,
-                on_text=_print_text,
-            )
-            print(f"\n{'━' * 60}")
-            print(f"  Done — {result['turns']} turn(s), {len(result['tool_results'])} tool call(s)")
-            print(f"{'━' * 60}\n")
+    def _do(prompt: str, files: list[str]) -> None:
+        print(f"\n{'━' * 60}")
+        print(f"  Task: {prompt[:120]}{'…' if len(prompt) > 120 else ''}")
+        print(f"{'━' * 60}")
+        result = wrapper.run(
+            prompt,
+            files,
+            on_tool_call=_on_tool_call,
+            on_prompt_ready=_on_prompt_ready,
+        )
+        print(f"\n{'━' * 60}")
+        print(f"  Done — {result['turns']} turn(s), {len(result['tool_results'])} tool call(s)")
+        print(f"{'━' * 60}\n")
+        if result["text"]:
+            print(result["text"])
 
-    # Run initial prompt if given
     if args.prompt:
-        _run_prompt(args.prompt, args.files)
+        _do(args.prompt, args.files or [])
 
-    # Interactive loop
-    if args.interactive:
-        print("\nInteractive mode. Type 'exit' or 'quit' to stop.\n")
+    if args.interactive or not args.prompt:
+        print("\nInteractive mode — type your task, 'exit' to quit.\n")
         while True:
             try:
-                user_input = input(">>> ").strip()
+                user_input = input("you> ").strip()
             except (EOFError, KeyboardInterrupt):
-                print("\nExiting.")
+                print("\nBye.")
                 break
             if user_input.lower() in ("exit", "quit", "q"):
                 break
             if not user_input:
                 continue
-            _run_prompt(user_input, [])
+            _do(user_input, [])
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    """Start the local API server."""
+    from .server import create_app
+
+    app = create_app(
+        allowed_roots=args.allowed_roots,
+        working_dir=args.working_dir,
+        max_turns=args.max_turns,
+    )
+    print(f"Starting Claude Code bridge server on http://127.0.0.1:{args.port}")
+    print("Endpoints:")
+    print(f"  POST /v1/messages              — start a session")
+    print(f"  POST /v1/sessions/<id>/respond — paste Claude's reply")
+    print(f"  GET  /v1/sessions/<id>         — check session status")
+    print(f"  GET  /health                   — health check\n")
+    app.run(host="127.0.0.1", port=args.port, debug=args.debug)
+
+
+# ---------- Argument parser ---------- #
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="claude-code",
+        description="Agentic coding via your Claude Pro web account — no API key needed.",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # --- `claude-code run` (default) ---
+    p_run = sub.add_parser("run", help="Interactive clipboard-bridge mode.")
+    p_run.add_argument("prompt", nargs="?", help="Task for Claude.")
+    p_run.add_argument("-f", "--files", nargs="*", default=[], help="Files to pre-load.")
+    p_run.add_argument("--max-turns", type=int, default=40)
+    p_run.add_argument("--allowed-roots", nargs="*", default=None)
+    p_run.add_argument("--working-dir", default=None)
+    p_run.add_argument("-i", "--interactive", action="store_true")
+
+    # --- `claude-code serve` ---
+    p_serve = sub.add_parser("serve", help="Start local API server.")
+    p_serve.add_argument("-p", "--port", type=int, default=5050)
+    p_serve.add_argument("--max-turns", type=int, default=40)
+    p_serve.add_argument("--allowed-roots", nargs="*", default=None)
+    p_serve.add_argument("--working-dir", default=None)
+    p_serve.add_argument("--debug", action="store_true")
+
+    args = parser.parse_args()
+
+    # Default to interactive run if no subcommand
+    if args.command is None or args.command == "run":
+        if args.command is None:
+            # Re-parse as 'run' with remaining args
+            args = p_run.parse_args(sys.argv[1:])
+        cmd_run(args)
+    elif args.command == "serve":
+        cmd_serve(args)
 
 
 if __name__ == "__main__":

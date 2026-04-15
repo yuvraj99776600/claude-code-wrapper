@@ -101,7 +101,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         timezone=args.timezone,
         locale=args.locale,
     )
-    print(f"Starting Claude Code API server on http://127.0.0.1:{args.port}")
+    print(f"Starting Claude Code API server on http://{args.host}:{args.port}")
     print(f"  Slots:      {args.slots}")
     print(f"  Headless:   {not args.visible}")
     print(f"  Rate limit: {args.rate_limit} msgs/hour/slot")
@@ -112,7 +112,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     if args.timezone:
         print(f"  Timezone:   {args.timezone}")
     print(f"  Profile:    {args.browser_profile or '~/.claude-code-wrapper/browser-profile'}\n")
-    uvicorn.run(app, host="127.0.0.1", port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 # ---------- Argument parser ---------- #
@@ -136,6 +136,7 @@ def main() -> None:
     # --- `claude-code serve` ---
     p_serve = sub.add_parser("serve", help="Start local API server with browser automation.")
     p_serve.add_argument("-p", "--port", type=int, default=5050)
+    p_serve.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1, use 0.0.0.0 for remote access).")
     p_serve.add_argument("-s", "--slots", type=int, default=3, help="Number of API keys / concurrent chats (default: 3).")
     p_serve.add_argument("--visible", action="store_true", help="Show the browser window (use for first-time login).")
     p_serve.add_argument("--browser-profile", default=None, help="Path to persistent browser profile directory.")

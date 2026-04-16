@@ -48,6 +48,7 @@ class MessageRequest(BaseModel):
     messages: list[dict[str, Any]] | None = None
     file_paths: list[str] = Field(default_factory=list)
     max_turns: int | None = None
+    raw: bool = False  # If True, send prompt directly without agentic wrapper
 
     def get_prompt(self) -> str:
         if self.prompt:
@@ -176,6 +177,15 @@ def create_app(
         if not prompt:
             raise HTTPException(400, "No prompt provided")
 
+        # Raw mode — send prompt directly, no agentic tool loop
+        if body.raw:
+            try:
+                raw_response = await _pool.send_message(api_key, prompt)
+            except Exception as exc:
+                log.error("Browser error (raw mode): %s", exc)
+                raise HTTPException(502, f"Browser error: {exc}")
+            return MessageResponse(text=raw_response, tool_results=[], turns=1)
+
         turns_limit = body.max_turns or _MAX_TURNS
         file_paths = body.file_paths
 
@@ -225,6 +235,90 @@ def create_app(
             tool_results=[ToolResultEntry(**r) for r in all_tool_results],
             turns=turn + 1,
         )
+
+    # ---- OpenAI-compatible endpoint ---- #
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        """OpenAI-compatible chat completions endpoint.
+
+        Accepts the standard OpenAI format so coding agents like
+        Continue, aider, Open Interpreter, etc. can use this as a drop-in backend.
+        Sends only the user's messages — no agentic tool wrapper.
+        """
+        api_key = _get_api_key(authorization)
+        if not _pool or not _pool.validate_key(api_key):
+            raise HTTPException(403, "Invalid API key")
+
+        body = await request.json()
+        messages = body.get("messages", [])
+
+        # Build a single prompt from all messages
+        parts: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    b.get("text", "") for b in content if b.get("type") == "text"
+                )
+            if role == "system":
+                parts.append(f"[System] {content}")
+            elif role == "user":
+                parts.append(content)
+            elif role == "assistant":
+                parts.append(f"[Previous assistant response] {content}")
+        prompt = "\n\n".join(parts)
+
+        if not prompt:
+            raise HTTPException(400, "No messages provided")
+
+        try:
+            raw_response = await _pool.send_message(api_key, prompt)
+        except Exception as exc:
+            log.error("Browser error (chat/completions): %s", exc)
+            raise HTTPException(502, f"Browser error: {exc}")
+
+        # Return in OpenAI format
+        import time as _time
+        return {
+            "id": f"chatcmpl-{api_key[:8]}",
+            "object": "chat.completion",
+            "created": int(_time.time()),
+            "model": "claude-pro-web",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": raw_response,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(prompt.split()),
+                "completion_tokens": len(raw_response.split()),
+                "total_tokens": len(prompt.split()) + len(raw_response.split()),
+            },
+        }
+
+    @app.get("/v1/models")
+    async def list_models():
+        """OpenAI-compatible models list — lets coding agents discover the model."""
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": "claude-pro-web",
+                    "object": "model",
+                    "owned_by": "claude-code-wrapper",
+                }
+            ],
+        }
 
     @app.post("/v1/chat/new")
     async def new_chat(authorization: str | None = Header(default=None)):

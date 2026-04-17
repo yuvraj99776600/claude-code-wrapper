@@ -1,16 +1,9 @@
-"""Claude Code - Browser-automated wrapper that turns your Claude Pro account into a local API."""
+"""Claude Code Wrapper — OpenAI-compatible API backed by the `claude` CLI."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
-from .wrapper import ClaudeCodeWrapper
-from .parser import parse_response, ParsedResponse, ToolCall
-from .tools import TOOL_DEFINITIONS, dispatch_tool
+from .chat_pool import ChatPool
+from .claude_cli import ClaudeCliError, ClaudeSession
+from .server import create_app
 
-__all__ = [
-    "ClaudeCodeWrapper",
-    "parse_response",
-    "ParsedResponse",
-    "ToolCall",
-    "TOOL_DEFINITIONS",
-    "dispatch_tool",
-]
+__all__ = ["ChatPool", "ClaudeCliError", "ClaudeSession", "create_app", "__version__"]

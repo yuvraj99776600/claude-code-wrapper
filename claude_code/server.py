@@ -1,346 +1,241 @@
-"""FastAPI server that exposes Claude via browser automation.
-
-Each API key maps to its own browser tab / Claude chat session.
-The server handles the full agentic tool loop internally:
-  prompt → Claude → parse tool calls → execute → send results → repeat → return final answer.
-"""
+"""OpenAI-compatible FastAPI server backed by Claude Code CLI sessions."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
-from pathlib import Path
-from typing import Any
-
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+import time
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .chat_pool import ChatPool
-from .prompt_builder import build_initial_prompt, build_tool_results_prompt
-from .parser import parse_response
-from .tools import dispatch_tool
+from .claude_cli import ClaudeCliError
 
 log = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------ #
-#  Config (set via env vars or CLI flags at startup)                   #
-# ------------------------------------------------------------------ #
-
-_pool: ChatPool | None = None
-
-_ALLOWED_ROOTS: list[str] = []
-_WORKING_DIR: str = ""
-_MAX_TURNS: int = 40
-
-
-# ------------------------------------------------------------------ #
-#  Request / response models                                          #
-# ------------------------------------------------------------------ #
-
-class MessageRequest(BaseModel):
-    """Incoming request body — mimics the Anthropic Messages API shape."""
-    prompt: str | None = None
-    content: str | None = None
-    messages: list[dict[str, Any]] | None = None
-    file_paths: list[str] = Field(default_factory=list)
-    max_turns: int | None = None
-    raw: bool = False  # If True, send prompt directly without agentic wrapper
-
-    def get_prompt(self) -> str:
-        if self.prompt:
-            return self.prompt
-        if self.content:
-            return self.content
-        if self.messages:
-            for msg in self.messages:
-                if msg.get("role") == "user":
-                    c = msg.get("content", "")
-                    if isinstance(c, list):
-                        return " ".join(
-                            b.get("text", "") for b in c if b.get("type") == "text"
-                        )
-                    return str(c)
-        return ""
+TOOL_EMOJI = {
+    "Write": "🔧",
+    "Edit": "✏️",
+    "Read": "📖",
+    "Bash": "💻",
+    "Grep": "🔍",
+    "Glob": "📁",
+    "WebFetch": "🌐",
+    "WebSearch": "🔎",
+    "Task": "🤖",
+}
 
 
-class ToolResultEntry(BaseModel):
-    tool_name: str
-    tool_input: dict[str, Any]
-    result: str
+def _extract_prompt(messages: list[dict]) -> str:
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages is required")
+
+    system_parts: list[str] = []
+    for m in messages:
+        if m.get("role") == "system":
+            c = m.get("content", "")
+            if isinstance(c, list):
+                t = "".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+            else:
+                t = str(c)
+            if t.strip():
+                system_parts.append(t)
+
+    last_user = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            c = m.get("content", "")
+            if isinstance(c, list):
+                last_user = "".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+            else:
+                last_user = str(c)
+            break
+
+    if system_parts and last_user:
+        return "\n\n".join(system_parts) + "\n\n" + last_user
+    return last_user or "\n\n".join(system_parts)
 
 
-class MessageResponse(BaseModel):
-    text: str
-    tool_results: list[ToolResultEntry]
-    turns: int
+def _openai_chunk(
+    completion_id: str,
+    model: str,
+    delta: dict,
+    finish_reason: str | None = None,
+) -> str:
+    payload = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+    return f"data: {json.dumps(payload)}\n\n"
 
 
-# ------------------------------------------------------------------ #
-#  App factory                                                        #
-# ------------------------------------------------------------------ #
+def _tool_use_banner(block: dict) -> str:
+    name = block.get("name", "tool")
+    emoji = TOOL_EMOJI.get(name, "🛠️")
+    inp = block.get("input", {}) or {}
+    detail = ""
+    if name in ("Write", "Edit", "Read"):
+        detail = inp.get("file_path", "")
+    elif name == "Bash":
+        detail = inp.get("command", "")
+    elif name in ("Grep", "Glob"):
+        detail = inp.get("pattern", "") or inp.get("query", "")
+    elif name in ("WebFetch", "WebSearch"):
+        detail = inp.get("url", "") or inp.get("query", "")
+    if detail:
+        if len(detail) > 120:
+            detail = detail[:117] + "..."
+        return f"\n{emoji} **{name}** `{detail}`\n"
+    return f"\n{emoji} **{name}**\n"
+
+
+def _translate_event(event: dict) -> list[str]:
+    etype = event.get("type")
+    out: list[str] = []
+    if etype == "assistant":
+        msg = event.get("message", {}) or {}
+        for block in msg.get("content", []) or []:
+            btype = block.get("type")
+            if btype == "text":
+                t = block.get("text", "")
+                if t:
+                    out.append(t)
+            elif btype == "tool_use":
+                out.append(_tool_use_banner(block))
+    return out
+
 
 def create_app(
     num_slots: int = 3,
-    headless: bool = True,
-    browser_profile: str | None = None,
-    allowed_roots: list[str] | None = None,
-    working_dir: str | None = None,
-    max_turns: int = 40,
-    rate_limit: int = 20,
-    min_delay: float = 2.0,
-    max_delay: float = 8.0,
-    proxy: str | None = None,
-    timezone: str | None = None,
-    locale: str | None = None,
+    cwd: str | Path | None = None,
+    model: str | None = None,
+    permission_mode: str = "bypassPermissions",
+    claude_bin: str = "claude",
 ) -> FastAPI:
-    global _pool, _ALLOWED_ROOTS, _WORKING_DIR, _MAX_TURNS
-
-    _ALLOWED_ROOTS = [str(Path(r).resolve()) for r in (allowed_roots or [os.getcwd()])]
-    _WORKING_DIR = working_dir or _ALLOWED_ROOTS[0]
-    _MAX_TURNS = max_turns
+    pool = ChatPool(
+        num_slots=num_slots,
+        cwd=cwd,
+        model=model,
+        permission_mode=permission_mode,
+        claude_bin=claude_bin,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global _pool
-        _pool = ChatPool(
-            num_slots=num_slots,
-            headless=headless,
-            browser_profile=browser_profile,
-            rate_limit=rate_limit,
-            min_delay=min_delay,
-            max_delay=max_delay,
-            proxy=proxy,
-            timezone=timezone,
-            locale=locale,
+        keys = pool.start()
+        banner = "\n".join(f"  {i+1}. {k}" for i, k in enumerate(keys))
+        print(
+            "\n" + "=" * 60 + "\n"
+            f"Claude Code wrapper ready — {len(keys)} slot(s)\n"
+            + "=" * 60 + "\n"
+            f"API keys:\n{banner}\n"
+            + "=" * 60 + "\n",
+            flush=True,
         )
-        keys = await _pool.start()
-
-        print("\n" + "=" * 60)
-        print("  Claude Code API Server")
-        print("=" * 60)
-        print(f"\n  {num_slots} chat slot(s) ready. Your API keys:\n")
-        for i, key in enumerate(keys, 1):
-            print(f"    Slot {i}: {key}")
-        print(f"\n  Rate limit: {rate_limit} msgs/hour per slot")
-        print(f"  Delay between messages: {min_delay}-{max_delay}s")
-        if proxy:
-            masked = proxy.split("@")[-1] if "@" in proxy else proxy
-            print(f"  Proxy: {masked}")
-        if timezone:
-            print(f"  Timezone: {timezone}")
-        print(f"\n  Usage:")
-        print(f'    curl -X POST http://localhost:PORT/v1/messages \\')
-        print(f'      -H "Authorization: Bearer <KEY>" \\')
-        print(f'      -H "Content-Type: application/json" \\')
-        print(f'      -d \'{{"prompt": "your task here", "file_paths": []}}\'')
-        print("=" * 60 + "\n")
-
         yield
 
-        await _pool.stop()
+    app = FastAPI(title="claude-code-wrapper", version="0.4.0", lifespan=lifespan)
 
-    app = FastAPI(
-        title="Claude Code API",
-        description="Browser-automated Claude API — no API key from Anthropic needed.",
-        lifespan=lifespan,
-    )
+    def _auth(request: Request) -> str:
+        header = request.headers.get("authorization", "")
+        if not header.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="missing bearer token")
+        key = header.split(" ", 1)[1].strip()
+        if not pool.validate_key(key):
+            raise HTTPException(status_code=401, detail="invalid api key")
+        return key
 
-    # ---- Auth helper ---- #
-
-    def _get_api_key(authorization: str | None) -> str:
-        if not authorization:
-            raise HTTPException(401, "Missing Authorization header")
-        parts = authorization.split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            return parts[1]
-        if len(parts) == 1:
-            return parts[0]
-        raise HTTPException(401, "Invalid Authorization format. Use 'Bearer <key>'")
-
-    # ---- Routes ---- #
-
-    @app.post("/v1/messages", response_model=MessageResponse)
-    async def messages(
-        body: MessageRequest,
-        authorization: str | None = Header(default=None),
-    ):
-        """Send a prompt, run the full agentic tool loop, return the result."""
-        api_key = _get_api_key(authorization)
-        if not _pool or not _pool.validate_key(api_key):
-            raise HTTPException(403, "Invalid API key")
-
-        prompt = body.get_prompt()
-        if not prompt:
-            raise HTTPException(400, "No prompt provided")
-
-        # Raw mode — send prompt directly, no agentic tool loop
-        if body.raw:
-            try:
-                raw_response = await _pool.send_message(api_key, prompt)
-            except Exception as exc:
-                log.error("Browser error (raw mode): %s", exc)
-                raise HTTPException(502, f"Browser error: {exc}")
-            return MessageResponse(text=raw_response, tool_results=[], turns=1)
-
-        turns_limit = body.max_turns or _MAX_TURNS
-        file_paths = body.file_paths
-
-        # Build the initial prompt with system instructions + file context
-        outgoing = build_initial_prompt(prompt, file_paths)
-        all_tool_results: list[dict[str, Any]] = []
-        final_text = ""
-
-        for turn in range(turns_limit):
-            # Send to Claude via the browser
-            try:
-                raw_response = await _pool.send_message(api_key, outgoing)
-            except Exception as exc:
-                log.error("Browser error on turn %d: %s", turn, exc)
-                raise HTTPException(502, f"Browser error: {exc}")
-
-            parsed = parse_response(raw_response)
-
-            if parsed.text:
-                final_text = parsed.text
-
-            if not parsed.has_tool_calls:
-                break
-
-            # Execute tool calls locally
-            turn_results: list[dict[str, Any]] = []
-            for tc in parsed.tool_calls:
-                result_str = dispatch_tool(
-                    tool_name=tc.tool,
-                    tool_input=tc.params,
-                    allowed_roots=_ALLOWED_ROOTS,
-                    working_dir=_WORKING_DIR,
-                )
-                entry = {
-                    "tool_name": tc.tool,
-                    "tool_input": tc.params,
-                    "result": result_str,
-                }
-                turn_results.append(entry)
-                all_tool_results.append(entry)
-
-            # Build follow-up prompt with results and send again
-            outgoing = build_tool_results_prompt(turn_results)
-
-        return MessageResponse(
-            text=final_text,
-            tool_results=[ToolResultEntry(**r) for r in all_tool_results],
-            turns=turn + 1,
-        )
-
-    # ---- OpenAI-compatible endpoint ---- #
-
-    @app.post("/v1/chat/completions")
-    async def chat_completions(
-        request: Request,
-        authorization: str | None = Header(default=None),
-    ):
-        """OpenAI-compatible chat completions endpoint.
-
-        Accepts the standard OpenAI format so coding agents like
-        Continue, aider, Open Interpreter, etc. can use this as a drop-in backend.
-        Sends only the user's messages — no agentic tool wrapper.
-        """
-        api_key = _get_api_key(authorization)
-        if not _pool or not _pool.validate_key(api_key):
-            raise HTTPException(403, "Invalid API key")
-
-        body = await request.json()
-        messages = body.get("messages", [])
-
-        # Build a single prompt from all messages
-        parts: list[str] = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    b.get("text", "") for b in content if b.get("type") == "text"
-                )
-            if role == "system":
-                parts.append(f"[System] {content}")
-            elif role == "user":
-                parts.append(content)
-            elif role == "assistant":
-                parts.append(f"[Previous assistant response] {content}")
-        prompt = "\n\n".join(parts)
-
-        if not prompt:
-            raise HTTPException(400, "No messages provided")
-
-        try:
-            raw_response = await _pool.send_message(api_key, prompt)
-        except Exception as exc:
-            log.error("Browser error (chat/completions): %s", exc)
-            raise HTTPException(502, f"Browser error: {exc}")
-
-        # Return in OpenAI format
-        import time as _time
-        return {
-            "id": f"chatcmpl-{api_key[:8]}",
-            "object": "chat.completion",
-            "created": int(_time.time()),
-            "model": "claude-pro-web",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": raw_response,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": len(prompt.split()),
-                "completion_tokens": len(raw_response.split()),
-                "total_tokens": len(prompt.split()) + len(raw_response.split()),
-            },
-        }
+    @app.get("/health")
+    async def health() -> dict:
+        return {"status": "ok", "slots": num_slots}
 
     @app.get("/v1/models")
-    async def list_models():
-        """OpenAI-compatible models list — lets coding agents discover the model."""
+    async def list_models() -> dict:
         return {
             "object": "list",
             "data": [
                 {
-                    "id": "claude-pro-web",
+                    "id": "claude-code",
                     "object": "model",
-                    "owned_by": "claude-code-wrapper",
+                    "created": int(time.time()),
+                    "owned_by": "anthropic",
                 }
             ],
         }
 
-    @app.post("/v1/chat/new")
-    async def new_chat(authorization: str | None = Header(default=None)):
-        """Reset the slot to a fresh Claude conversation."""
-        api_key = _get_api_key(authorization)
-        if not _pool or not _pool.validate_key(api_key):
-            raise HTTPException(403, "Invalid API key")
-        await _pool.new_chat(api_key)
-        return {"status": "ok", "message": "New chat started"}
-
     @app.get("/v1/keys")
-    async def list_keys():
-        """List all API keys and their status (for admin use)."""
-        if not _pool:
-            return {"keys": []}
-        return {"keys": _pool.list_keys()}
+    async def list_keys() -> dict:
+        return {"slots": pool.list_keys()}
 
-    @app.get("/health")
-    async def health():
-        return {
-            "status": "ok",
-            "slots": _pool.list_keys() if _pool else [],
-        }
+    @app.post("/v1/chat/new")
+    async def new_chat(request: Request) -> dict:
+        key = _auth(request)
+        pool.reset_session(key)
+        return {"status": "ok", "session_id": pool.get_session(key).session_id}
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request) -> Any:
+        key = _auth(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid json body")
+
+        messages = body.get("messages") or []
+        stream = bool(body.get("stream", False))
+        req_model = body.get("model") or "claude-code"
+        prompt = _extract_prompt(messages)
+        session = pool.get_session(key)
+        completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+
+        if stream:
+            async def gen() -> AsyncIterator[str]:
+                yield _openai_chunk(completion_id, req_model, {"role": "assistant", "content": ""})
+                try:
+                    async for event in session.stream(prompt):
+                        for piece in _translate_event(event):
+                            yield _openai_chunk(completion_id, req_model, {"content": piece})
+                    pool.mark_sent(key)
+                except ClaudeCliError as e:
+                    err = f"\n\n[claude-cli error: {e}]"
+                    yield _openai_chunk(completion_id, req_model, {"content": err})
+                yield _openai_chunk(completion_id, req_model, {}, finish_reason="stop")
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(gen(), media_type="text/event-stream")
+
+        parts: list[str] = []
+        try:
+            async for event in session.stream(prompt):
+                parts.extend(_translate_event(event))
+            pool.mark_sent(key)
+        except ClaudeCliError as e:
+            raise HTTPException(status_code=502, detail=f"claude cli error: {e}")
+
+        content = "".join(parts)
+        return JSONResponse(
+            {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": req_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        )
 
     return app
